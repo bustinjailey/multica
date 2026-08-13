@@ -1987,6 +1987,131 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime(t *testing.T) {
 	}
 }
 
+// TestDaemonRegister_LegacyMergeCarriesCustomName pins the machine's user-set
+// name (MUL-4217) across a daemon_id migration. The legacy row is deleted by the
+// merge, and registration never writes custom_name, so before the carry-over the
+// machine silently reverted to its daemon-proposed `Claude (hostname)` title the
+// first time a renamed host came back under a UUID daemon_id.
+func TestDaemonRegister_LegacyMergeCarriesCustomName(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	const legacyDaemonID = "NamedMachine.local"
+	const newDaemonID = "0192a7c0-1122-7f01-8d55-9a1c7b2e4d30"
+	const customName = "Claude Primary"
+
+	var legacyRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, daemon_id, name, custom_name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+		VALUES ($1, $2, 'Claude (NamedMachine)', $3, 'local', 'claude', 'offline', 'NamedMachine.local', '{}'::jsonb, $4, now() - interval '1 hour')
+		RETURNING id
+	`, testWorkspaceID, legacyDaemonID, customName, testUserID).Scan(&legacyRuntimeID); err != nil {
+		t.Fatalf("seed legacy runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, legacyRuntimeID)
+	})
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/daemon/register", map[string]any{
+		"workspace_id":      testWorkspaceID,
+		"daemon_id":         newDaemonID,
+		"legacy_daemon_ids": []string{legacyDaemonID},
+		"device_name":       "NamedMachine",
+		"runtimes": []map[string]any{
+			{"name": "named-runtime", "type": "claude", "version": "1.0.0", "status": "online"},
+		},
+	})
+	testHandler.DaemonRegister(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DaemonRegister: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	newRuntimeID := resp["runtimes"].([]any)[0].(map[string]any)["id"].(string)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, newRuntimeID)
+	})
+	if newRuntimeID == legacyRuntimeID {
+		t.Fatalf("expected a new runtime row, got the legacy id back")
+	}
+
+	var got *string
+	if err := testPool.QueryRow(ctx, `SELECT custom_name FROM agent_runtime WHERE id = $1`, newRuntimeID).Scan(&got); err != nil {
+		t.Fatalf("read custom_name: %v", err)
+	}
+	if got == nil || *got != customName {
+		t.Fatalf("custom_name not carried across the merge: got %v, want %q", got, customName)
+	}
+}
+
+// TestDaemonRegister_LegacyMergeKeepsNewerCustomName covers the other direction:
+// when the surviving row already carries a name, that name is the more recent
+// user intent and the legacy value must not overwrite it.
+func TestDaemonRegister_LegacyMergeKeepsNewerCustomName(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	const legacyDaemonID = "RenamedMachine.local"
+	const newDaemonID = "0192a7d0-2233-7a12-9e66-0b2d8c3f5e41"
+
+	var legacyRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, daemon_id, name, custom_name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+		VALUES ($1, $2, 'Claude (RenamedMachine)', 'Stale Name', 'local', 'claude', 'offline', '', '{}'::jsonb, $3, now() - interval '1 hour')
+		RETURNING id
+	`, testWorkspaceID, legacyDaemonID, testUserID).Scan(&legacyRuntimeID); err != nil {
+		t.Fatalf("seed legacy runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, legacyRuntimeID)
+	})
+
+	// The machine has already registered under its new daemon_id and been
+	// renamed there; only then does a registration carrying the legacy id land.
+	var newRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, daemon_id, name, custom_name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+		VALUES ($1, $2, 'Claude (RenamedMachine)', 'Current Name', 'local', 'claude', 'online', '', '{}'::jsonb, $3, now())
+		RETURNING id
+	`, testWorkspaceID, newDaemonID, testUserID).Scan(&newRuntimeID); err != nil {
+		t.Fatalf("seed current runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, newRuntimeID)
+	})
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/daemon/register", map[string]any{
+		"workspace_id":      testWorkspaceID,
+		"daemon_id":         newDaemonID,
+		"legacy_daemon_ids": []string{legacyDaemonID},
+		"device_name":       "RenamedMachine",
+		"runtimes": []map[string]any{
+			{"name": "renamed-runtime", "type": "claude", "version": "1.0.0", "status": "online"},
+		},
+	})
+	testHandler.DaemonRegister(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DaemonRegister: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var got *string
+	if err := testPool.QueryRow(ctx, `SELECT custom_name FROM agent_runtime WHERE id = $1`, newRuntimeID).Scan(&got); err != nil {
+		t.Fatalf("read custom_name: %v", err)
+	}
+	if got == nil || *got != "Current Name" {
+		t.Fatalf("legacy name overwrote the current one: got %v, want %q", got, "Current Name")
+	}
+}
+
 // TestDaemonRegister_MergesLegacyDaemonIDRuntime_ReverseDotLocal covers the
 // direction missed by the initial implementation: the stored runtime row is
 // `host` (no `.local`) but the daemon's current `os.Hostname()` now returns

@@ -719,8 +719,9 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 // lookup is case-insensitive and returns *all* matching rows — case-only drift
 // may have already minted duplicates historically (e.g. `Foo.local` AND
 // `foo.local` coexisting), and we need to consolidate every one of them, not
-// just the first. Per match we reassign agents and tasks, record the legacy
-// id on the new row for audit, then delete the stale row.
+// just the first. Per match we reassign agents and tasks, carry the machine's
+// custom name forward, record the legacy id on the new row for audit, then
+// delete the stale row.
 //
 // Scoping by (workspace_id, provider) is sufficient since provider is single-
 // runtime-per-daemon; `unique (workspace_id, daemon_id, provider)` prevents
@@ -847,6 +848,10 @@ func (h *Handler) mergeLegacyRuntime(ctx context.Context, newRuntimeID, oldRunti
 		return fmt.Errorf("reassign agents: %w", err)
 	}
 
+	if err := carryLegacyCustomName(ctx, qtx, newRuntimeID, oldRuntimeID); err != nil {
+		return err
+	}
+
 	// Inside the transaction this can no longer be best-effort: a failed statement
 	// poisons the transaction, so it either lands with the rest of the merge or the
 	// merge is rolled back.
@@ -872,6 +877,47 @@ func (h *Handler) mergeLegacyRuntime(ctx context.Context, newRuntimeID, oldRunti
 		"agents_reassigned", agents,
 		"tasks_reassigned", reassignment.ReassignedTasks,
 	)
+	return nil
+}
+
+// carryLegacyCustomName moves the machine's user-set name (MUL-4217) from the
+// legacy runtime row onto the surviving one, inside the merge transaction and
+// before the legacy row is deleted.
+//
+// Without it a daemon_id migration silently un-names the machine. custom_name is
+// the only durable home for a machine title — the registration upserts write
+// name = EXCLUDED.name on every heartbeat and deliberately never touch
+// custom_name — so once the legacy row is deleted the name is simply gone, and
+// the runtimes list falls back to the daemon-proposed `Claude (hostname)`.
+// inheritMachineCustomName cannot cover this: it reads sibling rows on the *new*
+// daemon_id, and a host registering under a fresh daemon_id has none.
+//
+// Only an unnamed target inherits; a name already set on the new row wins, since
+// that is the more recent user intent. Whitespace-only legacy values are treated
+// as unset, matching sharedCustomName on the frontend.
+func carryLegacyCustomName(ctx context.Context, qtx *db.Queries, newRuntimeID, oldRuntimeID pgtype.UUID) error {
+	old, err := qtx.GetAgentRuntime(ctx, oldRuntimeID)
+	if err != nil {
+		return fmt.Errorf("load legacy runtime: %w", err)
+	}
+	if !old.CustomName.Valid || strings.TrimSpace(old.CustomName.String) == "" {
+		return nil
+	}
+
+	current, err := qtx.GetAgentRuntime(ctx, newRuntimeID)
+	if err != nil {
+		return fmt.Errorf("load target runtime: %w", err)
+	}
+	if current.CustomName.Valid && strings.TrimSpace(current.CustomName.String) != "" {
+		return nil
+	}
+
+	if _, err := qtx.UpdateAgentRuntimeCustomName(ctx, db.UpdateAgentRuntimeCustomNameParams{
+		CustomName: old.CustomName,
+		ID:         newRuntimeID,
+	}); err != nil {
+		return fmt.Errorf("carry custom_name: %w", err)
+	}
 	return nil
 }
 
